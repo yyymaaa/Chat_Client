@@ -68,15 +68,13 @@ class MessengerClient {
     throw ('not implemented!')
   }
 
-  /**
- * Generate the message to be sent to another user.
- *
- * Arguments:
- *   name: string
- *   plaintext: string
- *
- * Return Type: Tuple of [dictionary, ArrayBuffer]
- */
+    async deriveMessageKey(chainKey) {
+                const messageKey = await HMACtoAESKey(chainKey, 'message');
+                const nextChainKey = await HMACtoHMACKey(chainKey, 'chain');
+                return { messageKey, nextChainKey };
+            }
+
+
   async sendMessage (name, plaintext) {
     throw ('not implemented!')
     const header = {}
@@ -84,15 +82,43 @@ class MessengerClient {
     return [header, ciphertext]
   }
 
-  /**
- * Decrypt a message received from another user.
- *
- * Arguments:
- *   name: string
- *   [header, ciphertext]: Tuple of [dictionary, ArrayBuffer]
- *
- * Return Type: string
- */
+ async findMessageKey(chain, Ns) {
+                if (chain.skipped.has(Ns)) {
+                    const messageKey = chain.skipped.get(Ns);
+                    chain.skipped.delete(Ns);
+                    return messageKey;
+                }
+                if (Ns < chain.Nr) {
+                    throw new Error(`Message replay or too old. Got Ns: ${Ns}, but expected Nr >= ${chain.Nr}`);
+                }
+
+                let messageKey;
+                let currentCKr = chain.CKr;
+                let currentNr = chain.Nr;
+
+                if (Ns === currentNr) {
+                    const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+                    messageKey = derivedKey;
+                    chain.CKr = nextChainKey;
+                    chain.Nr++;
+                    return messageKey;
+                }
+
+                while (currentNr < Ns) {
+                    const { messageKey: skippedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+                    chain.skipped.set(currentNr, skippedKey);
+                    currentCKr = nextChainKey;
+                    currentNr++;
+                }
+
+                const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+                messageKey = derivedKey;
+                chain.CKr = nextChainKey;
+                chain.Nr = currentNr + 1;
+                return messageKey;
+            }
+
+            
   async receiveMessage (name, [header, ciphertext]) {
     throw ('not implemented!')
     return plaintext
