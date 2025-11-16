@@ -48,7 +48,13 @@ class MessengerClient {
    */
   async generateCertificate (username) {
     throw ('not implemented!')
-    const certificate = {}
+
+     this.EGKeyPair = await generateEG()
+    this.username = username
+    const certificate = {
+      username: username,
+      publicKey: this.EGKeyPair.pub
+    }
     return certificate
   }
 
@@ -121,6 +127,108 @@ class MessengerClient {
             
   async receiveMessage (name, [header, ciphertext]) {
     throw ('not implemented!')
+    const headerKey = header.dhPublicKey
+
+
+    // 1. Connection/Ratchet State Check 
+    let chain
+    let isOldChain = false
+
+
+    if (!conn) {
+      // 1a. Initialize Connection (if first message received)
+      conn = this.conns[name] = {}
+      const dhSecret = await computeDH(this.EGKeyPair.sec, headerKey)
+      const [RK, CKr] = await HKDF(dhSecret, dhSecret, 'DoubleRatchet')
+      conn.RK = RK
+      conn.Ns = 0
+      conn.PNs = 0
+     
+      // Set current chain
+      conn.currentDHr = headerKey
+      conn.currentCKr = CKr
+      conn.currentNr = 0
+      conn.currentSkipped = new Map()
+      conn.oldChains = new Map()
+
+
+      // Perform DH ratchet for *sending*
+      conn.DHs = await generateEG()
+      const dhSecretNext = await computeDH(conn.DHs.sec, conn.currentDHr)
+      const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet')
+      conn.RK = RK_next
+      conn.CKs = CKs
+     
+      chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped }
+    } else if (headerKey === conn.currentDHr) {
+      // 1b. Message for Current Chain 
+      chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped }
+    } else if (conn.oldChains.has(headerKey)) {
+      // 1c. Message for Old, Saved Chain 
+      chain = conn.oldChains.get(headerKey)
+      isOldChain = true
+    } else {
+      // 1d. New Key: Perform DH Ratchet
+     
+      // Save the current chain before overwriting
+      conn.oldChains.set(conn.currentDHr, { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped })
+
+
+      // Perform DH ratchet (receiving)
+      conn.PNs = conn.Ns
+      conn.Ns = 0
+      const dhSecret = await computeDH(conn.DHs.sec, headerKey)
+      const [RK, CKr] = await HKDF(conn.RK, dhSecret, 'DoubleRatchet')
+      conn.RK = RK
+     
+      // Update current chain
+      conn.currentDHr = headerKey
+      conn.currentCKr = CKr
+      conn.currentNr = 0
+      conn.currentSkipped = new Map()
+
+
+      // Perform DH ratchet (sending)
+      conn.DHs = await generateEG()
+      const dhSecretNext = await computeDH(conn.DHs.sec, conn.currentDHr)
+      const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet')
+      conn.RK = RK_next
+      conn.CKs = CKs
+
+
+      chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped }
+    }
+
+
+    // 2. Find/Derive Message Key
+    const messageKey = await this.findMessageKey(chain, header.Ns) 
+
+
+    // 3. Update Main State (if not old chain) 
+    // If it's the current chain, we need to update the connection's
+    // state from the temporary 'chain' object.
+    // If it's an old chain, the 'chain' object *is* the state
+    // (it's a reference from the map), so changes persist automatically.
+    if (!isOldChain) {
+      conn.currentCKr = chain.CKr
+      conn.currentNr = chain.Nr
+    }
+
+
+    // 4. Decrypt Message 
+    try {
+      const plaintextBuffer = await decryptWithGCM(
+        messageKey,
+        ciphertext,
+        header.receiverIV,
+        JSON.stringify(header)
+      )
+      return bufferToString(plaintextBuffer)
+    } catch (error) {
+      console.error('Decryption failed!', error)
+      throw new Error('Decryption failed: Possible tampering or key mismatch')
+    }
+
     return plaintext
   }
 };
