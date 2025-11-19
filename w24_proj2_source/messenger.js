@@ -23,7 +23,7 @@ const {
 /** ******* Implementation ********/
 
 class MessengerClient {
-  constructor (certAuthorityPublicKey, govPublicKey) {
+  constructor(certAuthorityPublicKey, govPublicKey) {
     // the certificate authority DSA public key is used to
     // verify the authenticity and integrity of certificates
     // of other users (see handout and receiveCertificate)
@@ -46,10 +46,10 @@ class MessengerClient {
    *
    * Return Type: certificate object/dictionary
    */
-  async generateCertificate (username) {
+  async generateCertificate(username) {
     throw ('not implemented!')
 
-     this.EGKeyPair = await generateEG()
+    this.EGKeyPair = await generateEG()
     this.username = username
     const certificate = {
       username: username,
@@ -67,65 +67,131 @@ class MessengerClient {
  *
  * Return Type: void
  */
-  async receiveCertificate (certificate, signature) {
-  // The signature will be on the output of stringifying the certificate
-  // rather than on the certificate directly.
+  async receiveCertificate(certificate, signature) {
+    // The signature will be on the output of stringifying the certificate
+    // rather than on the certificate directly.
     const certString = JSON.stringify(certificate)
+    const isValid = await verifyWithECDSA(this.caPublicKey, certString, signature)
+    if (!isValid) {
+      throw new Error('Certificate signature verification failed - potential tampering detected')
+    }
+    this.certs[certificate.username] = certificate
     throw ('not implemented!')
+
+
   }
 
-    async deriveMessageKey(chainKey) {
-                const messageKey = await HMACtoAESKey(chainKey, 'message');
-                const nextChainKey = await HMACtoHMACKey(chainKey, 'chain');
-                return { messageKey, nextChainKey };
-            }
+  async deriveMessageKey(chainKey) {
+    const messageKey = await HMACtoAESKey(chainKey, 'message');
+    const nextChainKey = await HMACtoHMACKey(chainKey, 'chain');
+    return { messageKey, nextChainKey };
+  }
 
 
-  async sendMessage (name, plaintext) {
-    throw ('not implemented!')
-    const header = {}
-    const ciphertext = ''
+  async sendMessage(name, plaintext) {
+
+
+    //1. Initialize Connection (if first message) 
+    if (!conn) {
+      conn = this.conns[name] = {}
+      conn.DHs = await generateEG()
+      conn.currentDHr = this.certs[name].publicKey
+      const dhSecret = await computeDH(conn.DHs.sec, conn.currentDHr)
+      const [RK, CKs] = await HKDF(dhSecret, dhSecret, 'DoubleRatchet')
+
+      conn.RK = RK
+      conn.CKs = CKs
+      conn.currentCKr = null
+      conn.Ns = 0
+      conn.currentNr = 0
+      conn.PNs = 0
+      conn.currentSkipped = new Map()
+      conn.oldChains = new Map() // ADDED: To store old chains
+    }
+
+
+    // 2. Symmetric-key Ratchet 
+    const { messageKey, nextChainKey } = await this.deriveMessageKey(conn.CKs)
+    conn.CKs = nextChainKey
+
+
+    // 3. Create Header (and IVs) 
+    const receiverIV = genRandomSalt()
+    const ivGov = genRandomSalt()
+
+    const header = {
+      dhPublicKey: conn.DHs.pub,
+      Ns: conn.Ns,
+      PNs: conn.PNs,
+      receiverIV: receiverIV,
+      ivGov: ivGov
+    }
+
+
+    // 4. Government Encryption 
+    const messageKeyRaw = await subtle.exportKey('raw', messageKey)
+    const govDH = await computeDH(conn.DHs.sec, this.govPublicKey)
+    const govKey = await HMACtoAESKey(govDH, govEncryptionDataStr)
+    const cGov = await encryptWithGCM(govKey, messageKeyRaw, ivGov)
+
+    header.vGov = conn.DHs.pub
+    header.cGov = cGov
+
+
+    // 5. Encrypt Message 
+    const ciphertext = await encryptWithGCM(
+      messageKey,
+      plaintext,
+      receiverIV,
+      JSON.stringify(header)
+    )
+
+
+    conn.Ns++
+
+
     return [header, ciphertext]
+
   }
 
- async findMessageKey(chain, Ns) {
-                if (chain.skipped.has(Ns)) {
-                    const messageKey = chain.skipped.get(Ns);
-                    chain.skipped.delete(Ns);
-                    return messageKey;
-                }
-                if (Ns < chain.Nr) {
-                    throw new Error(`Message replay or too old. Got Ns: ${Ns}, but expected Nr >= ${chain.Nr}`);
-                }
+  async findMessageKey(chain, Ns) {
+    if (chain.skipped.has(Ns)) {
+      const messageKey = chain.skipped.get(Ns);
+      chain.skipped.delete(Ns);
+      return messageKey;
+    }
+    if (Ns < chain.Nr) {
+      throw new Error(`Message replay or too old. Got Ns: ${Ns}, but expected Nr >= ${chain.Nr}`);
+    }
 
-                let messageKey;
-                let currentCKr = chain.CKr;
-                let currentNr = chain.Nr;
+    let messageKey;
+    let currentCKr = chain.CKr;
+    let currentNr = chain.Nr;
 
-                if (Ns === currentNr) {
-                    const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
-                    messageKey = derivedKey;
-                    chain.CKr = nextChainKey;
-                    chain.Nr++;
-                    return messageKey;
-                }
+    if (Ns === currentNr) {
+      const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+      messageKey = derivedKey;
+      chain.CKr = nextChainKey;
+      chain.Nr++;
+      return messageKey;
+    }
 
-                while (currentNr < Ns) {
-                    const { messageKey: skippedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
-                    chain.skipped.set(currentNr, skippedKey);
-                    currentCKr = nextChainKey;
-                    currentNr++;
-                }
+    while (currentNr < Ns) {
+      const { messageKey: skippedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+      chain.skipped.set(currentNr, skippedKey);
+      currentCKr = nextChainKey;
+      currentNr++;
+    }
 
-                const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
-                messageKey = derivedKey;
-                chain.CKr = nextChainKey;
-                chain.Nr = currentNr + 1;
-                return messageKey;
-            }
+    const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+    messageKey = derivedKey;
+    chain.CKr = nextChainKey;
+    chain.Nr = currentNr + 1;
+    return messageKey;
+  }
 
-            
-  async receiveMessage (name, [header, ciphertext]) {
+
+  async receiveMessage(name, [header, ciphertext]) {
     throw ('not implemented!')
     const headerKey = header.dhPublicKey
 
@@ -143,7 +209,7 @@ class MessengerClient {
       conn.RK = RK
       conn.Ns = 0
       conn.PNs = 0
-     
+
       // Set current chain
       conn.currentDHr = headerKey
       conn.currentCKr = CKr
@@ -158,7 +224,7 @@ class MessengerClient {
       const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet')
       conn.RK = RK_next
       conn.CKs = CKs
-     
+
       chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped }
     } else if (headerKey === conn.currentDHr) {
       // 1b. Message for Current Chain 
@@ -169,7 +235,7 @@ class MessengerClient {
       isOldChain = true
     } else {
       // 1d. New Key: Perform DH Ratchet
-     
+
       // Save the current chain before overwriting
       conn.oldChains.set(conn.currentDHr, { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped })
 
@@ -180,7 +246,7 @@ class MessengerClient {
       const dhSecret = await computeDH(conn.DHs.sec, headerKey)
       const [RK, CKr] = await HKDF(conn.RK, dhSecret, 'DoubleRatchet')
       conn.RK = RK
-     
+
       // Update current chain
       conn.currentDHr = headerKey
       conn.currentCKr = CKr
@@ -201,7 +267,7 @@ class MessengerClient {
 
 
     // 2. Find/Derive Message Key
-    const messageKey = await this.findMessageKey(chain, header.Ns) 
+    const messageKey = await this.findMessageKey(chain, header.Ns)
 
 
     // 3. Update Main State (if not old chain) 

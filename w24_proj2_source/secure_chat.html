@@ -1,206 +1,352 @@
- <script>
-        class MessengerClient {
-            constructor(certAuthorityPublicKey, govPublicKey) {
-                this.caPublicKey = certAuthorityPublicKey;
-                this.govPublicKey = govPublicKey;
-                this.conns = {};
-                this.certs = {};
-                this.EGKeyPair = null;
-                this.username = null;
+<script>
+    class MessengerClient {
+        constructor(certAuthorityPublicKey, govPublicKey) {
+            this.caPublicKey = certAuthorityPublicKey;
+            this.govPublicKey = govPublicKey;
+            this.conns = {};
+            this.certs = {};
+            this.EGKeyPair = null;
+            this.username = null;
+        }
+
+
+        async generateCertificate(username) {
+            this.EGKeyPair = await generateEG();
+            this.username = username;
+            const certificate = {
+                username: username,
+                publicKey: this.EGKeyPair.pub
+            };
+            return certificate;
+        }
+
+
+        async receiveCertificate(certificate, signature) {
+            const certString = stringifyCert(certificate);
+            const isValid = await verifyWithECDSA(this.caPublicKey, certString, signature);
+            if (!isValid) {
+                throw new Error('Certificate signature verification failed - potential tampering detected');
+            }
+            this.certs[certificate.username] = certificate;
+        }
+
+
+        async deriveMessageKey(chainKey) {
+            const messageKey = await HMACtoAESKey(chainKey, 'message');
+            const nextChainKey = await HMACtoHMACKey(chainKey, 'chain');
+            return { messageKey, nextChainKey };
+        }
+
+
+        async sendMessage(name, plaintext) {
+            let conn = this.conns[name];
+            if (!conn) {
+                conn = this.conns[name] = {};
+                conn.DHs = await generateEG();
+                conn.currentDHr = this.certs[name].publicKey;
+                const dhSecret = await computeDH(conn.DHs.sec, conn.currentDHr);
+                const [RK, CKs] = await HKDF(dhSecret, dhSecret, 'DoubleRatchet');
+                conn.RK = RK;
+                conn.CKs = CKs;
+                conn.currentCKr = null;
+                conn.Ns = 0;
+                conn.currentNr = 0;
+                conn.PNs = 0;
+                conn.currentSkipped = new Map();
+                conn.oldChains = new Map();
             }
 
 
-            async generateCertificate(username) {
-                this.EGKeyPair = await generateEG();
-                this.username = username;
-                const certificate = {
-                    username: username,
-                    publicKey: this.EGKeyPair.pub
-                };
-                return certificate;
+            const { messageKey, nextChainKey } = await this.deriveMessageKey(conn.CKs);
+            conn.CKs = nextChainKey;
+
+
+            const receiverIV = genRandomSalt();
+            const ivGov = genRandomSalt();
+            const header = {
+                dhPublicKey: conn.DHs.pub,
+                Ns: conn.Ns,
+                PNs: conn.PNs,
+                receiverIV: receiverIV,
+                ivGov: ivGov
+            };
+
+
+            const messageKeyRaw = await subtle.exportKey('raw', messageKey);
+            const govDH = await computeDH(conn.DHs.sec, this.govPublicKey);
+            const govKey = await HMACtoAESKey(govDH, govEncryptionDataStr);
+            const cGov = await encryptWithGCM(govKey, messageKeyRaw, ivGov);
+            header.vGov = conn.DHs.pub;
+            header.cGov = cGov;
+
+
+            const ciphertext = await encryptWithGCM(
+                messageKey,
+                plaintext,
+                receiverIV,
+                JSON.stringify(header)
+            );
+            conn.Ns++;
+            return [header, ciphertext];
+        }
+
+
+        async findMessageKey(chain, Ns) {
+            if (chain.skipped.has(Ns)) {
+                const messageKey = chain.skipped.get(Ns);
+                chain.skipped.delete(Ns);
+                return messageKey;
+            }
+            if (Ns < chain.Nr) {
+                throw new Error(`Message replay or too old. Got Ns: ${Ns}, but expected Nr >= ${chain.Nr}`);
             }
 
 
-            async receiveCertificate(certificate, signature) {
-                const certString = stringifyCert(certificate);
-                const isValid = await verifyWithECDSA(this.caPublicKey, certString, signature);
-                if (!isValid) {
-                    throw new Error('Certificate signature verification failed - potential tampering detected');
-                }
-                this.certs[certificate.username] = certificate;
-            }
+            let messageKey;
+            let currentCKr = chain.CKr;
+            let currentNr = chain.Nr;
 
 
-            async deriveMessageKey(chainKey) {
-                const messageKey = await HMACtoAESKey(chainKey, 'message');
-                const nextChainKey = await HMACtoHMACKey(chainKey, 'chain');
-                return { messageKey, nextChainKey };
-            }
-
-
-            async sendMessage(name, plaintext) {
-                let conn = this.conns[name];
-                if (!conn) {
-                    conn = this.conns[name] = {};
-                    conn.DHs = await generateEG();
-                    conn.currentDHr = this.certs[name].publicKey;
-                    const dhSecret = await computeDH(conn.DHs.sec, conn.currentDHr);
-                    const [RK, CKs] = await HKDF(dhSecret, dhSecret, 'DoubleRatchet');
-                    conn.RK = RK;
-                    conn.CKs = CKs;
-                    conn.currentCKr = null;
-                    conn.Ns = 0;
-                    conn.currentNr = 0;
-                    conn.PNs = 0;
-                    conn.currentSkipped = new Map();
-                    conn.oldChains = new Map();
-                }
-
-
-                const { messageKey, nextChainKey } = await this.deriveMessageKey(conn.CKs);
-                conn.CKs = nextChainKey;
-
-
-                const receiverIV = genRandomSalt();
-                const ivGov = genRandomSalt();
-                const header = {
-                    dhPublicKey: conn.DHs.pub,
-                    Ns: conn.Ns,
-                    PNs: conn.PNs,
-                    receiverIV: receiverIV,
-                    ivGov: ivGov
-                };
-
-
-                const messageKeyRaw = await subtle.exportKey('raw', messageKey);
-                const govDH = await computeDH(conn.DHs.sec, this.govPublicKey);
-                const govKey = await HMACtoAESKey(govDH, govEncryptionDataStr);
-                const cGov = await encryptWithGCM(govKey, messageKeyRaw, ivGov);
-                header.vGov = conn.DHs.pub;
-                header.cGov = cGov;
-
-
-                const ciphertext = await encryptWithGCM(
-                    messageKey,
-                    plaintext,
-                    receiverIV,
-                    JSON.stringify(header)
-                );
-                conn.Ns++;
-                return [header, ciphertext];
-            }
-
-
-            async findMessageKey(chain, Ns) {
-                if (chain.skipped.has(Ns)) {
-                    const messageKey = chain.skipped.get(Ns);
-                    chain.skipped.delete(Ns);
-                    return messageKey;
-                }
-                if (Ns < chain.Nr) {
-                    throw new Error(`Message replay or too old. Got Ns: ${Ns}, but expected Nr >= ${chain.Nr}`);
-                }
-
-
-                let messageKey;
-                let currentCKr = chain.CKr;
-                let currentNr = chain.Nr;
-
-
-                if (Ns === currentNr) {
-                    const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
-                    messageKey = derivedKey;
-                    chain.CKr = nextChainKey;
-                    chain.Nr++;
-                    return messageKey;
-                }
-
-
-                while (currentNr < Ns) {
-                    const { messageKey: skippedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
-                    chain.skipped.set(currentNr, skippedKey);
-                    currentCKr = nextChainKey;
-                    currentNr++;
-                }
-
-
+            if (Ns === currentNr) {
                 const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
                 messageKey = derivedKey;
                 chain.CKr = nextChainKey;
-                chain.Nr = currentNr + 1;
+                chain.Nr++;
                 return messageKey;
             }
 
 
-            async receiveMessage(name, [header, ciphertext]) {
-                let conn = this.conns[name];
-                const headerKey = header.dhPublicKey;
-                let chain;
-                let isOldChain = false;
+            while (currentNr < Ns) {
+                const { messageKey: skippedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+                chain.skipped.set(currentNr, skippedKey);
+                currentCKr = nextChainKey;
+                currentNr++;
+            }
 
 
-                if (!conn) {
-                    conn = this.conns[name] = {};
-                    const dhSecret = await computeDH(this.EGKeyPair.sec, headerKey);
-                    const [RK, CKr] = await HKDF(dhSecret, dhSecret, 'DoubleRatchet');
-                    conn.RK = RK;
-                    conn.Ns = 0;
-                    conn.PNs = 0;
-                    conn.currentDHr = headerKey;
-                    conn.currentCKr = CKr;
-                    conn.currentNr = 0;
-                    conn.currentSkipped = new Map();
-                    conn.oldChains = new Map();
-                    conn.DHs = await generateEG();
-                    const dhSecretNext = await computeDH(conn.DHs.sec, conn.currentDHr);
-                    const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet');
-                    conn.RK = RK_next;
-                    conn.CKs = CKs;
-                    chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped };
-                } else if (headerKey === conn.currentDHr) {
-                    chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped };
-                } else if (conn.oldChains.has(headerKey)) {
-                    chain = conn.oldChains.get(headerKey);
-                    isOldChain = true;
-                } else {
-                    conn.oldChains.set(conn.currentDHr, { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped });
-                    conn.PNs = conn.Ns;
-                    conn.Ns = 0;
-                    const dhSecret = await computeDH(conn.DHs.sec, headerKey);
-                    const [RK, CKr] = await HKDF(conn.RK, dhSecret, 'DoubleRatchet');
-                    conn.RK = RK;
-                    conn.currentDHr = headerKey;
-                    conn.currentCKr = CKr;
-                    conn.currentNr = 0;
-                    conn.currentSkipped = new Map();
-                    conn.DHs = await generateEG();
-                    const dhSecretNext = await computeDH(conn.DHs.sec, conn.currentDHr);
-                    const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet');
-                    conn.RK = RK_next;
-                    conn.CKs = CKs;
-                    chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped };
-                }
+            const { messageKey: derivedKey, nextChainKey } = await this.deriveMessageKey(currentCKr);
+            messageKey = derivedKey;
+            chain.CKr = nextChainKey;
+            chain.Nr = currentNr + 1;
+            return messageKey;
+        }
 
 
-                const messageKey = await this.findMessageKey(chain, header.Ns);
-                if (!isOldChain) {
-                    conn.currentCKr = chain.CKr;
-                    conn.currentNr = chain.Nr;
-                }
+        async receiveMessage(name, [header, ciphertext]) {
+            let conn = this.conns[name];
+            const headerKey = header.dhPublicKey;
+            let chain;
+            let isOldChain = false;
 
 
-                try {
-                    const plaintextBuffer = await decryptWithGCM(
-                        messageKey,
-                        ciphertext,
-                        header.receiverIV,
-                        JSON.stringify(header)
-                    );
-                    return bufferToString(plaintextBuffer);
-                } catch (error) {
-                    console.error('Decryption failed!', error);
-                    throw new Error('Decryption failed: Possible tampering or key mismatch');
-                }
+            if (!conn) {
+                conn = this.conns[name] = {};
+                const dhSecret = await computeDH(this.EGKeyPair.sec, headerKey);
+                const [RK, CKr] = await HKDF(dhSecret, dhSecret, 'DoubleRatchet');
+                conn.RK = RK;
+                conn.Ns = 0;
+                conn.PNs = 0;
+                conn.currentDHr = headerKey;
+                conn.currentCKr = CKr;
+                conn.currentNr = 0;
+                conn.currentSkipped = new Map();
+                conn.oldChains = new Map();
+                conn.DHs = await generateEG();
+                const dhSecretNext = await computeDH(conn.DHs.sec, conn.currentDHr);
+                const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet');
+                conn.RK = RK_next;
+                conn.CKs = CKs;
+                chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped };
+            } else if (headerKey === conn.currentDHr) {
+                chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped };
+            } else if (conn.oldChains.has(headerKey)) {
+                chain = conn.oldChains.get(headerKey);
+                isOldChain = true;
+            } else {
+                conn.oldChains.set(conn.currentDHr, { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped });
+                conn.PNs = conn.Ns;
+                conn.Ns = 0;
+                const dhSecret = await computeDH(conn.DHs.sec, headerKey);
+                const [RK, CKr] = await HKDF(conn.RK, dhSecret, 'DoubleRatchet');
+                conn.RK = RK;
+                conn.currentDHr = headerKey;
+                conn.currentCKr = CKr;
+                conn.currentNr = 0;
+                conn.currentSkipped = new Map();
+                conn.DHs = await generateEG();
+                const dhSecretNext = await computeDH(conn.DHs.sec, conn.currentDHr);
+                const [RK_next, CKs] = await HKDF(conn.RK, dhSecretNext, 'DoubleRatchet');
+                conn.RK = RK_next;
+                conn.CKs = CKs;
+                chain = { CKr: conn.currentCKr, Nr: conn.currentNr, skipped: conn.currentSkipped };
+            }
+
+
+            const messageKey = await this.findMessageKey(chain, header.Ns);
+            if (!isOldChain) {
+                conn.currentCKr = chain.CKr;
+                conn.currentNr = chain.Nr;
+            }
+
+
+            try {
+                const plaintextBuffer = await decryptWithGCM(
+                    messageKey,
+                    ciphertext,
+                    header.receiverIV,
+                    JSON.stringify(header)
+                );
+                return bufferToString(plaintextBuffer);
+            } catch (error) {
+                console.error('Decryption failed!', error);
+                throw new Error('Decryption failed: Possible tampering or key mismatch');
             }
         }
-    </script>
+    }
+</script>
+<script>
+
+
+    // Get UI elements
+    const chatLog = document.getElementById('chat-log');
+    const simLog = document.getElementById('sim-log');
+    const userSelect = document.getElementById('user-select');
+    const messageInput = document.getElementById('message-input');
+    const sendButton = document.getElementById('send-button');
+
+
+    // Global store for our app state
+    const appState = {
+        caKeyPair: null,
+        govKeyPair: null,
+        clients: {
+            alice: null,
+            bob: null
+        },
+    };
+
+
+    // Log Functions 
+    function addChat(message, sender) {
+        const align = (sender === 'alice') ? 'self-start' : 'self-end';
+        const color = (sender === 'alice') ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800';
+        const html = `
+                <div class="${align} ${color} p-3 rounded-lg max-w-xs text-sm shadow">
+                    <p class="font-medium">${sender.charAt(0).toUpperCase() + sender.slice(1)}</p>
+                    <p>${message}</p>
+                </div>
+            `;
+        chatLog.innerHTML += html;
+        chatLog.scrollTop = chatLog.scrollHeight; // Auto-scroll
+    }
+
+
+    function addSimLog(message, type = 'info') {
+        const color = (type === 'error') ? 'text-red-500' : (type === 'success') ? 'text-green-600' : 'text-gray-600';
+        simLog.innerHTML += `<p class="${color}">&gt; ${message}</p>`;
+        simLog.scrollTop = simLog.scrollHeight; // Auto-scroll
+    }
+
+
+    //Simulation Setup 
+    async function initializeSimulation() {
+        try {
+            addSimLog('Sim: Generating Certificate Authority keys...');
+            appState.caKeyPair = await generateECDSA();
+
+            addSimLog('Sim: Generating Government keys...');
+            appState.govKeyPair = await generateEG();
+
+
+            addSimLog('Sim: Initializing Alice\'s client...');
+            appState.clients.alice = new MessengerClient(appState.caKeyPair.pub, appState.govKeyPair.pub);
+
+            addSimLog('Sim: Initializing Bob\'s client...');
+            appState.clients.bob = new MessengerClient(appState.caKeyPair.pub, appState.govKeyPair.pub);
+
+
+            addSimLog('Sim: Generating certificates...');
+            const certAlice = await appState.clients.alice.generateCertificate('alice');
+            const certBob = await appState.clients.bob.generateCertificate('bob');
+
+
+            addSimLog('CA: Signing Alice\'s certificate...');
+            const sigAlice = await signWithECDSA(appState.caKeyPair.sec, stringifyCert(certAlice));
+
+            addSimLog('CA: Signing Bob\'s certificate...');
+            const sigBob = await signWithECDSA(appState.caKeyPair.sec, stringifyCert(certBob));
+
+
+            addSimLog('Sim: Distributing certificates...');
+            await appState.clients.alice.receiveCertificate(certBob, sigBob);
+            await appState.clients.bob.receiveCertificate(certAlice, sigAlice);
+
+
+            addSimLog('Simulation ready.', 'success');
+        } catch (err) {
+            addSimLog(`Initialization failed: ${err}`, 'error');
+        }
+    }
+
+
+    //Send Message Logic 
+    async function handleSendMessage() {
+        const senderName = userSelect.value;
+        const recipientName = (senderName === 'alice') ? 'bob' : 'alice';
+        const messageText = messageInput.value;
+
+
+        if (!messageText) return;
+
+
+        const sender = appState.clients[senderName];
+        const recipient = appState.clients[recipientName];
+
+        addSimLog(`Sim: ${senderName} sending to ${recipientName}...`);
+        sendButton.disabled = true;
+
+
+        try {
+            // 1. Sender encrypts the message
+            const [header, ciphertext] = await sender.sendMessage(recipientName, messageText);
+            addSimLog('Sim: Message encrypted. (Ciphertext size: ' + ciphertext.byteLength + ' bytes)');
+
+            // 2. "Network" delivers message to recipient
+            // We just call the receive function directly
+            addSimLog(`Sim: ${recipientName} receiving message...`);
+            const decryptedText = await recipient.receiveMessage(senderName, [header, ciphertext]);
+            addSimLog('Sim: Message decrypted.', 'success');
+
+
+            // 3. Display the message in the chat UI
+            if (decryptedText === messageText) {
+                addChat(decryptedText, senderName);
+                messageInput.value = ''; // Clear input
+            } else {
+                addSimLog('CRITICAL ERROR: Decrypted text does not match original!', 'error');
+            }
+
+
+        } catch (err) {
+            addSimLog(`Send/Receive failed: ${err}`, 'error');
+        } finally {
+            sendButton.disabled = false;
+            messageInput.focus();
+        }
+    }
+
+
+    //Event Listeners 
+    window.addEventListener('load', initializeSimulation);
+    sendButton.addEventListener('click', handleSendMessage);
+    messageInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            handleSendMessage();
+        }
+    });
+
+
+</script>
+</body>
+
+</html>

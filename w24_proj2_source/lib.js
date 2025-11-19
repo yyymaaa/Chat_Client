@@ -19,19 +19,19 @@ const { subtle } = require('node:crypto').webcrypto
 
 const govEncryptionDataStr = 'AES-GENERATION'
 
-function bufferToString (arr) {
+function bufferToString(arr) {
   // Converts from ArrayBuffer to string
   // Used to go from output of decryptWithGCM to string
   return Buffer.from(arr).toString()
 }
 
-function genRandomSalt (len = 16) {
+function genRandomSalt(len = 16) {
   // Used to generate IVs for AES encryption
   // Used in combination with encryptWithGCM and decryptWithGCM
   return crypto.getRandomValues(new Uint8Array(len))
 }
 
-async function cryptoKeyToJSON (cryptoKey) {
+async function cryptoKeyToJSON(cryptoKey) {
   // Used to and return CryptoKey in JSON format
   // Can console.log() the returned variable to see printed key in a readable format
   // This function can be helpfl for debugging since console.log() on cryptoKey
@@ -40,7 +40,7 @@ async function cryptoKeyToJSON (cryptoKey) {
   return key
 }
 
-async function generateEG () {
+async function generateEG() {
   // returns a pair of ElGamal keys as an object
   // private key is keypairObject.sec
   // public key is keypairObject.pub
@@ -49,7 +49,7 @@ async function generateEG () {
   return keypairObject
 }
 
-async function computeDH (myPrivateKey, theirPublicKey) {
+async function computeDH(myPrivateKey, theirPublicKey) {
   // computes Diffie-Hellman key exchange for an EG private key and EG public key
   // myPrivateKey should be pair.sec from generateEG output
   // theirPublicKey should be pair.pub from generateEG output
@@ -60,7 +60,7 @@ async function computeDH (myPrivateKey, theirPublicKey) {
     { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign', 'verify'])
 }
 
-async function verifyWithECDSA (publicKey, message, signature) {
+async function verifyWithECDSA(publicKey, message, signature) {
   // returns true if signature is correct for message and publicKey
   // publicKey should be pair.pub from generateECDSA
   // message must be a string
@@ -69,7 +69,7 @@ async function verifyWithECDSA (publicKey, message, signature) {
   return await subtle.verify({ name: 'ECDSA', hash: { name: 'SHA-384' } }, publicKey, signature, Buffer.from(message))
 }
 
-async function HMACtoAESKey (key, data, exportToArrayBuffer = false) {
+async function HMACtoAESKey(key, data, exportToArrayBuffer = false) {
   // Performs HMAC to derive a new key with derivedKeyAlgorithm AES
   // if exportToArrayBuffer is true, return key as ArrayBuffer. Otherwise, output CryptoKey
   // key is a CryptoKey
@@ -91,7 +91,7 @@ async function HMACtoAESKey (key, data, exportToArrayBuffer = false) {
   return out
 }
 
-async function HMACtoHMACKey (key, data) {
+async function HMACtoHMACKey(key, data) {
   // Performs HMAC to derive a new key with derivedKeyAlgorithm HMAC
   // key is a CryptoKey
   // data is a string
@@ -102,7 +102,7 @@ async function HMACtoHMACKey (key, data) {
   return await subtle.importKey('raw', hmacBuf, { name: 'HMAC', hash: 'SHA-256', length: 256 }, true, ['sign'])
 }
 
-async function HKDF (inputKey, salt, infoStr) {
+async function HKDF(inputKey, salt, infoStr) {
   // Calculates HKDF outputs
   // inputKey is a cryptoKey with derivedKeyAlgorithm HMAC
   // salt is a second cryptoKey with derivedKeyAlgorithm HMAC
@@ -129,7 +129,7 @@ async function HKDF (inputKey, salt, infoStr) {
   return [hkdfOut1, hkdfOut2]
 }
 
-async function encryptWithGCM (key, plaintext, iv, authenticatedData = '') {
+async function encryptWithGCM(key, plaintext, iv, authenticatedData = '') {
   // Encrypts using the GCM mode.
   // key is a cryptoKey with derivedKeyAlgorithm AES-GCM
   // plaintext is a string or ArrayBuffer of the data you want to encrypt.
@@ -144,7 +144,7 @@ async function encryptWithGCM (key, plaintext, iv, authenticatedData = '') {
   return await subtle.encrypt({ name: 'AES-GCM', iv, additionalData: Buffer.from(authenticatedData) }, key, Buffer.from(plaintext))
 }
 
-async function decryptWithGCM (key, ciphertext, iv, authenticatedData = '') {
+async function decryptWithGCM(key, ciphertext, iv, authenticatedData = '') {
   // Decrypts using the GCM mode.
   // key is a cryptoKey with derivedKeyAlgorithm AES-GCM
   // ciphertext is an ArrayBuffer
@@ -165,7 +165,7 @@ async function decryptWithGCM (key, ciphertext, iv, authenticatedData = '') {
 // tests for certificate signatures in test-messenger.js.
 /// /////////////////////////////////////////////////////////////////////////////
 
-async function generateECDSA () {
+async function generateECDSA() {
   // returns a pair of Digital Signature Algorithm keys as an object
   // private key is keypairObject.sec
   // public key is keypairObject.pub
@@ -174,7 +174,7 @@ async function generateECDSA () {
   return keypairObject
 }
 
-async function signWithECDSA (privateKey, message) {
+async function signWithECDSA(privateKey, message) {
   // returns signature of message with privateKey
   // privateKey should be pair.sec from generateECDSA
   // message is a string
